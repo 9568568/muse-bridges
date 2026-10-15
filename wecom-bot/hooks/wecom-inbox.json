@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "id": "wecom-inbox",
+  "enabled": true,
+  "script_path": "~/hooks/scripts/wecom-inbox.sh",
+  "prompt": "企业微信(wecom-bot)收件箱有新消息。用 `~/.local/bin/wecom-bot inbox pull` 拉取消息,处理每条消息(理解用户意图并回复)。回复时用 `echo '回复内容' | ~/.local/bin/wecom-bot send --reply-to <event_id> --text -` (单聊用 response_url 直接回,纯文本即可)。最后用 `~/.local/bin/wecom-bot inbox ack <event_id>` 确认每条已处理的消息。只回复纯文本,不要用 markdown 表格等多余格式。",
+  "poll_interval_secs": 1,
+  "script_timeout_secs": 600,
+  "delivery": {
+    "surface": "main"
+  },
+  "presentation_locale": "zh-CN",
+  "created_at_ms": 1791881223334,
+  "updated_at_ms": 1791881856565
+}

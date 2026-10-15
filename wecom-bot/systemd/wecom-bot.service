@@ -1,0 +1,14 @@
+[Unit]
+Description=wecom-bot WeChat Work bridge for Muse
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+Environment=HOME=/home/hatch
+WorkingDirectory=/home/hatch
+EnvironmentFile=%h/.config/wecom-bot/env
+ExecStart=%h/.local/bin/wecom-bot run
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=default.target

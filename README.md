@@ -65,7 +65,7 @@ muse-bridges-pkg/
 
 ## 完整包下载 (含 wx-bot 二进制)
 
-- **Google Drive**: [muse-bridges-v1.tar.gz](https://drive.google.com/file/d/1QfKxYv2wXYZ1234567890/view) (35MB, 链接待更新)
+- **Google Drive**: [muse-bridges-v1.tar.gz](https://drive.google.com/file/d/1xf4ABCSlUSdGZvuMBJgFyN2x8mqkWQ5I/view?usp=drivesdk) (35MB, 链接待更新)
 
 ```bash
 tar xzf muse-bridges-v1.tar.gz

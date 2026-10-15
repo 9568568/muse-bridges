@@ -63,11 +63,3 @@ muse-bridges-pkg/
 - wecom-bot (Python, 2026-10-14)
 - 本包：2026-10-15 (含 1 秒轮询优化)
 
-## 完整包下载 (含 wx-bot 二进制)
-
-- **Google Drive**: [muse-bridges-v1.tar.gz](https://drive.google.com/file/d/1xf4ABCSlUSdGZvuMBJgFyN2x8mqkWQ5I/view?usp=drivesdk) (35MB, 链接待更新)
-
-```bash
-tar xzf muse-bridges-v1.tar.gz
-cd muse-bridges-pkg && bash install.sh
-```

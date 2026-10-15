@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+"""wecom-bot: 企业微信智能机器人消息桥 (WebSocket 长连接模式)
+架构: 常驻服务收消息进 SQLite inbox, CLI  pull/ack/send, hook 轮询唤醒.
+"""
+import json, os, sys, time, sqlite3, uuid, threading, argparse
+from pathlib import Path
+
+HOME = Path(os.environ.get("HOME", "/home/hatch"))
+CONFIG_PATH = HOME / ".config/wecom-bot/config.json"
+STATE_DIR = HOME / ".local/state/wecom-bot"
+DB_PATH = STATE_DIR / "inbox.db"
+WS_URL = "wss://openws.work.weixin.qq.com"
+
+def load_config():
+    with open(CONFIG_PATH) as f:
+        return json.load(f)
+
+def get_db():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(str(DB_PATH), timeout=30)
+    db.execute("""CREATE TABLE IF NOT EXISTS inbox (
+        event_id TEXT PRIMARY KEY, kind TEXT, chat_id TEXT, chat_type TEXT,
+        from_user TEXT, msg_type TEXT, text TEXT, raw TEXT,
+        created_at REAL, leased_until REAL DEFAULT 0, acked INTEGER DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS outbox (
+        id TEXT PRIMARY KEY, chat_id TEXT, text TEXT,
+        created_at REAL, sent INTEGER DEFAULT 0, error TEXT)""")
+    try:
+        db.execute("ALTER TABLE outbox ADD COLUMN chat_type INTEGER DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
+    db.execute("""CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)""")
+    db.commit()
+    return db
+
+# ---------- Service ----------
+def run_service():
+    import websocket
+    # 补丁: 企微服务器握手返回 Connection: close 而非 Upgrade,放宽校验
+    try:
+        from websocket import _handshake
+        import base64 as _b64, hashlib as _hl
+        def _patched_validate(headers, key, subprotocols):
+            accept = headers.get("sec-websocket-accept", "")
+            expected = _b64.b64encode(_hl.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode().strip()
+            if accept.strip() != expected:
+                from websocket import WebSocketException
+                raise WebSocketException("Invalid WebSocket Header")
+            # 跳过 Connection/Upgrade 头校验 (企微返回 Connection: close)
+            return True, None
+        _handshake._validate = _patched_validate
+    except Exception as e:
+        print(f"[ws] patch failed: {e}", flush=True)
+    cfg = load_config()
+    bot_id = cfg["bot_id"]
+    secret = cfg["bot_secret"]
+    seq = [0]
+    def req_id(prefix):
+        seq[0] += 1
+        return f"{prefix}_{seq[0]}_{int(time.time()*1000)}"
+
+    def reply_simple(text, response_url):
+        """简单问答即时回复,不经过 worker。返回 True 表示已处理。"""
+        import subprocess, datetime
+        t = text.strip()
+        reply = None
+        # 时间查询
+        if any(k in t for k in ["几点", "时间", "现在几点", "几点了"]):
+            now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%H:%M")
+            reply = f"现在是北京时间 {now}。"
+        # 问候
+        elif t in ["你好", "hi", "hello", "在吗", "在么", "hi lux", "lux"]:
+            reply = "在呢，有事直接说。"
+        # 测试
+        elif any(k in t.lower() for k in ["试下", "测试", "test", "ping"]):
+            reply = "企微通道正常，收发都没问题。"
+        if reply and response_url:
+            payload = json.dumps({"msgtype": "markdown", "markdown": {"content": reply}}, ensure_ascii=False)
+            try:
+                p = subprocess.run(["curl", "-s", "--max-time", "10", "-X", "POST", response_url,
+                                    "-H", "Content-Type: application/json", "-d", payload],
+                                   capture_output=True, text=True, timeout=15)
+                result = json.loads(p.stdout) if p.stdout.strip() else {}
+                if result.get("errcode") == 0:
+                    print(f"[instant] replied: {t[:30]} -> {reply[:30]}", flush=True)
+                    return True
+            except Exception as e:
+                print(f"[instant] failed: {e}", flush=True)
+        return False
+
+    def store_event(body):
+        db = get_db()
+        try:
+            eid = f"evt_{uuid.uuid4().hex[:16]}"
+            msgtype = body.get("msgtype", "")
+            text = ""
+            if msgtype == "text":
+                text = (body.get("text") or {}).get("content", "")
+            elif msgtype == "voice":
+                v = body.get("voice") or {}
+                text = (v.get("content") or v.get("text") or "").strip()
+            # 保存 response_url (单聊回复用,一次性)
+            raw = dict(body)
+            response_url = raw.get("response_url", "")
+            # 简单问答即时回复,成功则直接标记已处理,不经过 worker
+            if text and response_url and reply_simple(text, response_url):
+                db.execute("INSERT INTO inbox (event_id,kind,chat_id,chat_type,from_user,msg_type,text,raw,created_at,acked) VALUES (?,?,?,?,?,?,?,?,?,1)",
+                    (eid, "message", body.get("chatid"), body.get("chattype"),
+                     (body.get("from") or {}).get("userid"), msgtype, text,
+                     json.dumps(raw, ensure_ascii=False), time.time()))
+                db.commit()
+                print(f"[inbox] {eid} instant-replied & acked", flush=True)
+                return
+            db.execute("INSERT INTO inbox (event_id,kind,chat_id,chat_type,from_user,msg_type,text,raw,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (eid, "message", body.get("chatid"), body.get("chattype"),
+                 (body.get("from") or {}).get("userid"), msgtype, text,
+                 json.dumps(raw, ensure_ascii=False), time.time()))
+            db.execute("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_msg_at', ?)", (str(time.time()),))
+            db.commit()
+            print(f"[inbox] {eid} from={body.get('from',{}).get('userid')} type={msgtype} text={text[:40]}", flush=True)
+        finally:
+            db.close()
+
+    def send_via_ws(ws, oid, chat_id, text, chat_type):
+        # 主动推送 aibot_send_msg: 单聊 chatid=用户userid + chat_type=1;
+        # msgtype 官方只支持 markdown/template_card (不支持 text, 用 markdown 发纯文本)
+        b = text.encode("utf-8")
+        chunks = [b[i:i+2000].decode("utf-8", "ignore") for i in range(0, len(b), 2000)] or [""]
+        for ch in chunks:
+            rid = req_id("aibot_send_msg")
+            frame = {"cmd": "aibot_send_msg", "headers": {"req_id": rid},
+                     "body": {"chatid": chat_id, "chat_type": chat_type, "msgtype": "markdown",
+                              "markdown": {"content": ch}}}
+            ws.send(json.dumps(frame, ensure_ascii=False))
+            pending_send[rid] = oid
+
+    def pump_outbox(ws):
+        while True:
+            time.sleep(2)
+            db = get_db()
+            try:
+                rows = db.execute("SELECT id,chat_id,text,chat_type FROM outbox WHERE sent=0 ORDER BY created_at LIMIT 10").fetchall()
+                for oid, chat_id, text, ctype in rows:
+                    try:
+                        send_via_ws(ws, oid, chat_id, text, ctype or 1)
+                        db.execute("UPDATE outbox SET sent=1 WHERE id=?", (oid,))
+                        print(f"[send] ok {oid} -> {chat_id}", flush=True)
+                    except Exception as e:
+                        db.execute("UPDATE outbox SET error=? WHERE id=?", (str(e)[:200], oid))
+                        print(f"[send] fail {oid}: {e}", flush=True)
+                db.commit()
+            finally:
+                db.close()
+
+    backoff = 1
+    # 待确认的推送: req_id -> 发起时间; 主循环收到服务端 errcode!=0 时回写 outbox.error
+    pending_send = {}
+    # 代理设置 (websocket-client 需要显式传入)
+    import urllib.parse
+    _proxy = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY") or os.environ.get("http_proxy")
+    _proxy_kwargs = {}
+    if _proxy:
+        _pu = urllib.parse.urlparse(_proxy)
+        _proxy_kwargs = {"http_proxy_host": _pu.hostname, "http_proxy_port": _pu.port,
+                         "http_proxy_auth": (_pu.username, _pu.password) if _pu.username else None}
+    while True:
+        try:
+            ws = websocket.create_connection(WS_URL, timeout=30, **_proxy_kwargs)
+            print("[ws] connected", flush=True)
+            # 订阅认证
+            rid = req_id("aibot_subscribe")
+            ws.send(json.dumps({"cmd": "aibot_subscribe", "headers": {"req_id": rid},
+                                "body": {"bot_id": bot_id, "secret": secret}}, ensure_ascii=False))
+            resp = json.loads(ws.recv())
+            if not resp.get("errcode") == 0:
+                print(f"[ws] subscribe failed: {resp}", flush=True)
+                ws.close()
+                raise RuntimeError(f"subscribe failed: {resp.get('errmsg')}")
+            print("[ws] subscribed ok", flush=True)
+            db = get_db()
+            db.execute("INSERT OR REPLACE INTO meta (k,v) VALUES ('connected_at', ?)", (str(time.time()),))
+            db.execute("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_error', '')")
+            db.commit(); db.close()
+            backoff = 1
+
+            # 发件箱泵
+            t = threading.Thread(target=pump_outbox, args=(ws,), daemon=True)
+            t.start()
+
+            # 心跳: 每轮 ping 周期在 meta 写 heartbeat_at, 供 health 检查进程存活/循环未卡死
+            last_ping = time.time()
+            last_hb = 0
+            ws.settimeout(35)
+            while True:
+                now = time.time()
+                if now - last_ping > 25:
+                    ws.ping()
+                    last_ping = now
+                if now - last_hb > 20:
+                    try:
+                        db3 = get_db()
+                        db3.execute("INSERT OR REPLACE INTO meta (k,v) VALUES ('heartbeat_at', ?)", (str(now),))
+                        db3.commit(); db3.close()
+                    except Exception:
+                        pass
+                    last_hb = now
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    continue
+                if not raw:
+                    continue
+                try:
+                    frame = json.loads(raw)
+                except Exception:
+                    continue
+                if frame.get("cmd") == "aibot_msg_callback":
+                    store_event(frame.get("body", {}))
+                # 推送回执: errcode!=0 说明服务端拒绝,回写 error 以便排查
+                rid = (frame.get("headers") or {}).get("req_id")
+                if rid in pending_send:
+                    oid = pending_send.pop(rid)
+                    err = frame.get("errcode")
+                    if err not in (0, None):
+                        d2 = get_db()
+                        try:
+                            d2.execute("UPDATE outbox SET error=? WHERE id=?",
+                                       (f"server errcode={err} errmsg={frame.get('errmsg')}", oid))
+                            d2.commit()
+                        finally:
+                            d2.close()
+                        print(f"[send] server rejected {oid}: {err} {frame.get('errmsg')}", flush=True)
+        except Exception as e:
+            print(f"[ws] error: {e}, reconnect in {backoff}s", flush=True)
+            db = get_db()
+            db.execute("INSERT OR REPLACE INTO meta (k,v) VALUES ('last_error', ?)", (str(e)[:300],))
+            db.commit(); db.close()
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+# ---------- CLI ----------
+def cmd_count(args):
+    db = get_db()
+    now = time.time()
+    n = db.execute("SELECT COUNT(*) FROM inbox WHERE acked=0 AND leased_until<?", (now,)).fetchone()[0]
+    print(n)
+
+def cmd_pull(args):
+    db = get_db()
+    now = time.time()
+    lease_until = now + 30 * 60
+    # 原子操作: 直接 UPDATE 符合条件的行并返回,避免并发重复拉取
+    # SQLite 3.35+ 支持 RETURNING
+    try:
+        rows = db.execute(
+            """UPDATE inbox SET leased_until=? WHERE event_id IN (
+                 SELECT event_id FROM inbox WHERE acked=0 AND leased_until<? ORDER BY created_at LIMIT 20
+               ) RETURNING event_id,kind,chat_id,chat_type,from_user,msg_type,text,created_at""",
+            (lease_until, now)).fetchall()
+    except sqlite3.OperationalError:
+        # 旧版 SQLite 不支持 RETURNING,降级为事务锁
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute(
+            "SELECT event_id,kind,chat_id,chat_type,from_user,msg_type,text,created_at FROM inbox WHERE acked=0 AND leased_until<? ORDER BY created_at LIMIT 20",
+            (now,)).fetchall()
+        for r in rows:
+            db.execute("UPDATE inbox SET leased_until=? WHERE event_id=?", (lease_until, r[0]))
+    events = []
+    for r in rows:
+        events.append({"event_id": r[0], "kind": r[1], "chat_id": r[2], "chat_type": r[3],
+                       "from_user": r[4], "msg_type": r[5], "text": r[6], "created_at": r[7]})
+    db.commit(); db.close()
+    print(json.dumps({"events": events}, ensure_ascii=False))
+
+def cmd_ack(args):
+    db = get_db()
+    db.execute("UPDATE inbox SET acked=1 WHERE event_id=?", (args.event_id,))
+    db.commit(); db.close()
+    print("acked", args.event_id)
+
+def cmd_send(args):
+    text = sys.stdin.read() if args.text == "-" else args.text
+    db = get_db()
+    # 如果指定了 reply_to 且该消息有 response_url (单聊),直接 HTTP 回复
+    if args.reply_to:
+        row = db.execute("SELECT raw FROM inbox WHERE event_id=?", (args.reply_to,)).fetchone()
+        if row:
+            try:
+                raw = json.loads(row[0])
+                rurl = raw.get("response_url")
+                if rurl:
+                    import subprocess
+                    payload = json.dumps({"msgtype": "markdown", "markdown": {"content": text}}, ensure_ascii=False)
+                    # 用 curl (urllib 的代理处理有问题)
+                    p = subprocess.run(["curl", "-s", "--max-time", "15", "-X", "POST", rurl,
+                                        "-H", "Content-Type: application/json", "-d", payload],
+                                       capture_output=True, text=True, timeout=20)
+                    result = json.loads(p.stdout) if p.stdout.strip() else {}
+                    db.close()
+                    if result.get("errcode") == 0:
+                        print(f"replied via response_url to {args.reply_to}")
+                        return
+                    else:
+                        print(f"response_url failed: {result}, falling back to WS", file=sys.stderr)
+            except Exception as e:
+                print(f"response_url error: {e}, falling back to WS", file=sys.stderr)
+    oid = f"out_{uuid.uuid4().hex[:12]}"
+    # 解析会话类型: 收件箱里 from_user==to 的单聊 -> chat_type=1; chat_id==to 的群聊 -> 2
+    ctype = 1
+    row = db.execute("SELECT 1 FROM inbox WHERE from_user=? AND chat_type='single' LIMIT 1", (args.to,)).fetchone()
+    if not row:
+        row = db.execute("SELECT 1 FROM inbox WHERE chat_id=? AND chat_type='group' LIMIT 1", (args.to,)).fetchone()
+        if row:
+            ctype = 2
+    db.execute("INSERT INTO outbox (id,chat_id,text,chat_type,created_at) VALUES (?,?,?,?,?)",
+               (oid, args.to, text, ctype, time.time()))
+    db.commit(); db.close()
+    print(f"queued {oid} -> {args.to} (chat_type={ctype}, service sends via WS)")
+
+def cmd_health(args):
+    # 先确认服务进程在跑(旧版把这步放在 stale 之后, 永远不可达)
+    import subprocess
+    p = subprocess.run(["pgrep", "-f", "[w]ecom-bot run"], capture_output=True)
+    if p.returncode != 0:
+        print("service not running"); sys.exit(1)
+    db = get_db()
+    row = db.execute("SELECT v FROM meta WHERE k='heartbeat_at'").fetchone()
+    conn = db.execute("SELECT v FROM meta WHERE k='connected_at'").fetchone()
+    err = db.execute("SELECT v FROM meta WHERE k='last_error'").fetchone()
+    db.close()
+    err_s = err[0] if err else ""
+    now = time.time()
+    if row:
+        age = now - float(row[0])
+        if age > 120:
+            print(f"stale: last heartbeat {int(age)}s ago; err={err_s}"); sys.exit(1)
+        c_age = int(now - float(conn[0])) if conn else -1
+        print(f"ok (heartbeat {int(age)}s ago, connected {c_age}s ago)")
+        return
+    # 无心跳(旧版本桥或刚启动): 给 5 分钟宽限
+    if conn and now - float(conn[0]) <= 300:
+        print(f"ok (connected {int(now - float(conn[0]))}s ago, heartbeat pending)")
+        return
+    print(f"stale: no heartbeat; err={err_s}"); sys.exit(1)
+
+def cmd_status(args):
+    db = get_db()
+    n = db.execute("SELECT COUNT(*) FROM inbox WHERE acked=0").fetchone()[0]
+    m = db.execute("SELECT COUNT(*) FROM outbox WHERE sent=0").fetchone()[0]
+    db.close()
+    print(f"inbox pending: {n}, outbox unsent: {m}")
+
+def main():
+    ap = argparse.ArgumentParser(prog="wecom-bot")
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("run")
+    sub.add_parser("status"); sub.add_parser("health")
+    p = sub.add_parser("inbox"); sp = p.add_subparsers(dest="op")
+    sp.add_parser("count"); sp.add_parser("pull")
+    pa = sp.add_parser("ack"); pa.add_argument("event_id")
+    ps = sub.add_parser("send"); ps.add_argument("--to", required=False, default=""); ps.add_argument("--text", required=True); ps.add_argument("--reply-to", default="")
+    args = ap.parse_args()
+    if args.cmd == "run": run_service()
+    elif args.cmd == "status": cmd_status(args)
+    elif args.cmd == "health": cmd_health(args)
+    elif args.cmd == "inbox" and args.op == "count": cmd_count(args)
+    elif args.cmd == "inbox" and args.op == "pull": cmd_pull(args)
+    elif args.cmd == "inbox" and args.op == "ack": cmd_ack(args)
+    elif args.cmd == "send": cmd_send(args)
+    else: ap.print_help()
+
+if __name__ == "__main__":
+    main()
